@@ -73,32 +73,60 @@ namespace Microsoft.AspNetCore.SignalR
 
         public int? LocalPort => Features.Get<IHttpConnectionFeature>()?.LocalPort;
 
-        private object _lockObj = new object();
-
         public virtual Task WriteAsync(HubMessage message)
         {
+            // We were unable to get the lock so take the slow async path of waiting for the semaphore
             if (!_writeLock.Wait(0))
             {
                 return WriteSlowAsync(message);
             }
 
-            // This will internally cache the buffer for each unique HubProtocol/DataEncoder combination
-            // So that we don't serialize the HubMessage for every single connection
-            var buffer = message.WriteMessage(Protocol);
-            _connectionContext.Transport.Output.Write(buffer);
+            // This method should never throw synchronously
+            var task = WriteCore(message);
 
-            // Interlocked.Exchange(ref _lastSendTimestamp, Stopwatch.GetTimestamp());
-
-            var task = _connectionContext.Transport.Output.FlushAsync();
-
+            // The write didn't complete synchronously so await completion
             if (!task.IsCompleted)
             {
                 return CompleteWriteAsync(task);
             }
 
+            // The write failed so observe the exception
+            if (task.IsFaulted)
+            {
+                try
+                {
+                    task.GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    Log.FailedWritingMessage(_logger, ex);
+                }
+            }
+
+            // Otherwise, release the lock
             _writeLock.Release();
 
             return Task.CompletedTask;
+        }
+
+        private ValueTask<FlushResult> WriteCore(HubMessage message)
+        {
+            try
+            {
+                // This will internally cache the buffer for each unique HubProtocol
+                // So that we don't serialize the HubMessage for every single connection
+                var buffer = message.WriteMessage(Protocol);
+
+                _connectionContext.Transport.Output.Write(buffer);
+
+                return _connectionContext.Transport.Output.FlushAsync();
+            }
+            catch (Exception ex)
+            {
+                Log.FailedWritingMessage(_logger, ex);
+
+                return new ValueTask<FlushResult>(new FlushResult(isCanceled: false, isCompleted: true));
+            }
         }
 
         private async Task CompleteWriteAsync(ValueTask<FlushResult> task)
@@ -106,6 +134,10 @@ namespace Microsoft.AspNetCore.SignalR
             try
             {
                 await task;
+            }
+            catch (Exception ex)
+            {
+                Log.FailedWritingMessage(_logger, ex);
             }
             finally
             {
@@ -119,14 +151,11 @@ namespace Microsoft.AspNetCore.SignalR
             {
                 await _writeLock.WaitAsync();
 
-                // This will internally cache the buffer for each unique HubProtocol/DataEncoder combination
-                // So that we don't serialize the HubMessage for every single connection
-                var buffer = message.WriteMessage(Protocol);
-                _connectionContext.Transport.Output.Write(buffer);
-
-                // Interlocked.Exchange(ref _lastSendTimestamp, Stopwatch.GetTimestamp());
-
-                await _connectionContext.Transport.Output.FlushAsync();
+                await WriteCore(message);
+            }
+            catch (Exception ex)
+            {
+                Log.FailedWritingMessage(_logger, ex);
             }
             finally
             {
@@ -134,23 +163,33 @@ namespace Microsoft.AspNetCore.SignalR
             }
         }
 
-        private async Task TryWritePingAsync()
+        private Task TryWritePingAsync()
         {
             // Don't wait for the lock, if it returns false that means someone wrote to the connection
             // and we don't need to send a ping anymore
-            if (!await _writeLock.WaitAsync(0))
+            if (!_writeLock.Wait(0))
             {
-                return;
+                return Task.CompletedTask;
             }
 
+            return TryWritePingSlowAsync();
+        }
+
+        private async Task TryWritePingSlowAsync()
+        {
             try
             {
                 Debug.Assert(_cachedPingMessage != null);
+
                 _connectionContext.Transport.Output.Write(_cachedPingMessage);
 
-                Interlocked.Exchange(ref _lastSendTimestamp, Stopwatch.GetTimestamp());
-
                 await _connectionContext.Transport.Output.FlushAsync();
+
+                Log.SentPing(_logger);
+            }
+            catch (Exception ex)
+            {
+                Log.FailedWritingMessage(_logger, ex);
             }
             finally
             {
@@ -263,16 +302,15 @@ namespace Microsoft.AspNetCore.SignalR
             // If it is, we send a ping frame, if not, we no-op on this tick. This means that in the worst case, the
             // true "ping rate" of the server could be (_hubOptions.KeepAliveInterval + HubEndPoint.KeepAliveTimerInterval),
             // because if the interval elapses right after the last tick of this timer, it won't be detected until the next tick.
-
             if (Stopwatch.GetTimestamp() - Interlocked.Read(ref _lastSendTimestamp) > _keepAliveDuration)
             {
                 // Haven't sent a message for the entire keep-alive duration, so send a ping.
                 // If the transport channel is full, this will fail, but that's OK because
                 // adding a Ping message when the transport is full is unnecessary since the
                 // transport is still in the process of sending frames.
-
                 _ = TryWritePingAsync();
-                Log.SentPing(_logger);
+
+                Interlocked.Exchange(ref _lastSendTimestamp, Stopwatch.GetTimestamp());
             }
         }
 
@@ -308,6 +346,14 @@ namespace Microsoft.AspNetCore.SignalR
 
             private static readonly Action<ILogger, Exception> _transportBufferFull =
                 LoggerMessage.Define(LogLevel.Debug, new EventId(4, "TransportBufferFull"), "Unable to send Ping message to client, the transport buffer is full.");
+
+            private static readonly Action<ILogger, Exception> _failedWritingMessage =
+                LoggerMessage.Define(LogLevel.Trace, new EventId(5, "FailedWritingMessage"), "Failed writing message.");
+
+            public static void FailedWritingMessage(ILogger logger, Exception exception)
+            {
+                _failedWritingMessage(logger, exception);
+            }
 
             public static void UsingHubProtocol(ILogger logger, string hubProtocol)
             {
