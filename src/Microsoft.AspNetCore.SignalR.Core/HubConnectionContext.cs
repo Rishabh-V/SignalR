@@ -58,7 +58,7 @@ namespace Microsoft.AspNetCore.SignalR
 
         public string UserIdentifier { get; private set; }
 
-        internal virtual IHubProtocol Protocol { get; set; }
+        public virtual IHubProtocol Protocol { get; set; }
 
         internal ExceptionDispatchInfo AbortException { get; private set; }
 
@@ -73,18 +73,58 @@ namespace Microsoft.AspNetCore.SignalR
 
         public int? LocalPort => Features.Get<IHttpConnectionFeature>()?.LocalPort;
 
-        public virtual async Task WriteAsync(HubMessage message)
-        {
-            await _writeLock.WaitAsync();
+        private object _lockObj = new object();
 
+        public virtual Task WriteAsync(HubMessage message)
+        {
+            if (!_writeLock.Wait(0))
+            {
+                return WriteSlowAsync(message);
+            }
+
+            // This will internally cache the buffer for each unique HubProtocol/DataEncoder combination
+            // So that we don't serialize the HubMessage for every single connection
+            var buffer = message.WriteMessage(Protocol);
+            _connectionContext.Transport.Output.Write(buffer);
+
+            // Interlocked.Exchange(ref _lastSendTimestamp, Stopwatch.GetTimestamp());
+
+            var task = _connectionContext.Transport.Output.FlushAsync();
+
+            if (!task.IsCompleted)
+            {
+                return CompleteWriteAsync(task);
+            }
+
+            _writeLock.Release();
+
+            return Task.CompletedTask;
+        }
+
+        private async Task CompleteWriteAsync(ValueTask<FlushResult> task)
+        {
             try
             {
+                await task;
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
+
+        private async Task WriteSlowAsync(HubMessage message)
+        {
+            try
+            {
+                await _writeLock.WaitAsync();
+
                 // This will internally cache the buffer for each unique HubProtocol/DataEncoder combination
                 // So that we don't serialize the HubMessage for every single connection
                 var buffer = message.WriteMessage(Protocol);
                 _connectionContext.Transport.Output.Write(buffer);
 
-                Interlocked.Exchange(ref _lastSendTimestamp, Stopwatch.GetTimestamp());
+                // Interlocked.Exchange(ref _lastSendTimestamp, Stopwatch.GetTimestamp());
 
                 await _connectionContext.Transport.Output.FlushAsync();
             }
